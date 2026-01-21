@@ -24,6 +24,9 @@ const int FAN_PWM_PIN     = 25;
 const int FAN_PWM_CHANNEL = 0;
 const int FAN_PWM_FREQ    = 25000; // 25 kHz
 const int FAN_PWM_RES     = 8;     // 8-bit
+const int FAN_TACH_PIN    = 35;
+const int FAN_TACH_PULSES_PER_REV = 2;
+const unsigned long FAN_TACH_INTERVAL_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // WIFI CONFIG
@@ -48,6 +51,9 @@ const unsigned long PRINT_INTERVAL_MS = 5000;   // every 5 seconds
 
 // Fan duty tracking (for logs + web)
 static int g_LastFanDuty = -1;
+volatile uint32_t g_FanTachPulses = 0;
+float g_FanRpm = NAN;
+unsigned long g_LastFanTachMs = 0;
 
 // Env / BMP / SCD
 float g_TempC      = NAN;   // unified temp used everywhere (SCD41 preferred)
@@ -323,6 +329,29 @@ void setFanDutyPercent(int dutyPercent) {
     Serial.print("[FAN] Duty changed to ");
     Serial.print(dutyPercent);
     Serial.println("%");
+}
+
+void IRAM_ATTR onFanTachPulse() {
+    g_FanTachPulses++;
+}
+
+void updateFanTachRpm() {
+    unsigned long now = millis();
+    if (now - g_LastFanTachMs < FAN_TACH_INTERVAL_MS) return;
+
+    unsigned long elapsedMs = now - g_LastFanTachMs;
+    g_LastFanTachMs = now;
+
+    uint32_t pulses = 0;
+    noInterrupts();
+    pulses = g_FanTachPulses;
+    g_FanTachPulses = 0;
+    interrupts();
+
+    if (elapsedMs == 0) return;
+
+    float revs = pulses / (float)FAN_TACH_PULSES_PER_REV;
+    g_FanRpm = (revs * 60000.0f) / elapsedMs;
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +815,12 @@ void printStatus() {
     Serial.print("  Duty ................. ");
     Serial.print(g_LastFanDuty);
     Serial.println(" %");
+    Serial.print("  Tach RPM ............. ");
+    if (isnan(g_FanRpm)) {
+        Serial.println("n/a");
+    } else {
+        Serial.println(g_FanRpm, 0);
+    }
 
     Serial.println("\n[PM]");
     Serial.print("  Status ............... ");
@@ -1035,6 +1070,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="card">
       <div class="label">Fan Duty</div>
       <div class="value"><span id="fanDuty">0</span> %</div>
+      <div class="label">RPM: <span id="fanRpm">-</span></div>
       <div class="label" id="fanModeLabel">Fan: AUTO</div>
     </div>
   </div>
@@ -1098,6 +1134,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const elTempF  = document.getElementById('tempF');
     const elPress  = document.getElementById('pressHpa');
     const elFan    = document.getElementById('fanDuty');
+    const elFanRpm = document.getElementById('fanRpm');
     const elPmSt   = document.getElementById('pmStatus');
     const elVocSt  = document.getElementById('vocStatus');
     const elNoxSt  = document.getElementById('noxStatus');
@@ -1335,6 +1372,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const tempF      = j.temp_f;
         const pressHpa   = j.press_hpa;
         const fanDuty    = j.fan_duty;
+        const fanRpm     = j.fan_rpm;
         const co2ppm     = j.co2_ppm;
         const rhPercent  = j.rh_percent;
 
@@ -1346,6 +1384,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         elTempF.textContent = tempF.toFixed(2);
         elPress.textContent = pressHpa.toFixed(1);
         elFan.textContent   = fanDuty;
+        if (!isNaN(fanRpm)) elFanRpm.textContent = fanRpm.toFixed(0);
+        else                elFanRpm.textContent = '-';
 
         if (!isNaN(co2ppm)) elCo2.textContent = co2ppm.toFixed(1);
         else                elCo2.textContent = '-';
@@ -1465,6 +1505,7 @@ void handleData() {
     json += "\"co2_ppm\":"       + String(g_Co2Ppm, 1) + ",";
     json += "\"rh_percent\":"    + String(g_Rh, 1) + ",";
     json += "\"fan_duty\":"      + String(g_LastFanDuty) + ",";
+    json += "\"fan_rpm\":"       + String(g_FanRpm, 0) + ",";
     json += "\"fan_mode\":\""    + String(g_FanManualOverride ? "manual" : "auto") + "\",";
     json += "\"fan_manual_duty\":"+ String(g_FanManualDuty) + ",";
     json += "\"status_pm\":\""   + g_statusPM   + "\",";
@@ -1519,6 +1560,8 @@ void setup() {
 
     ledcSetup(FAN_PWM_CHANNEL, FAN_PWM_FREQ, FAN_PWM_RES);
     ledcAttachPin(FAN_PWM_PIN, FAN_PWM_CHANNEL);
+    pinMode(FAN_TACH_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onFanTachPulse, FALLING);
 
     connectWifi();
     server.on("/", handleRoot);
@@ -1534,6 +1577,7 @@ void loop() {
     readSensorsPeriodic();
     updateWebStatusAndHazard();
     updateFanFromAirQuality();
+    updateFanTachRpm();
 
     unsigned long now = millis();
     if (now - g_LastPrintMs > PRINT_INTERVAL_MS) {
